@@ -1,11 +1,29 @@
-# app.py — HealthLens (Two Tabs + Streaming + Readable Answer UI)
-# ---------------------------------------------------------------
-# Upload PDF/CSV/TXT -> Vertex AI embeddings -> Elastic index
-# Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answer
-# UI: two tabs, readable answer (big type), accordions for sources/snippets, download .md
+# app.py — HealthLens (Two Tabs + Streaming + Readable UI + Web Ingest Agent)
+# ---------------------------------------------------------------------------
+# Upload PDF/CSV/TXT -> Vertex AI embeddings -> Elasticsearch (serverless-safe)
+# Paste URLs -> Agent fetches pages (robots-aware) -> cleans text -> chunks -> embeds -> indexes
+# Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answers
+#
+# .env (use forward slashes on Windows paths):
+#   GOOGLE_APPLICATION_CREDENTIALS=C:/path/to/service-account.json
+#   VERTEX_PROJECT_ID=your-project-id
+#   VERTEX_LOCATION=us-central1
+#   VERTEX_MODEL_CHAT=gemini-1.5-flash-001
+#   VERTEX_MODEL_EMBED=text-embedding-004
+#   ELASTIC_CLOUD_ENDPOINT=https://<your-id>.<region>.elastic.cloud:443
+#   ELASTIC_API_KEY=<api_key>
+#   ELASTIC_INDEX=healthlens-docs
+#   CHUNK_SIZE=1200
+#   CHUNK_OVERLAP=200
+#   TOP_K=8
+#
+# Install:
+#   pip install gradio python-dotenv elasticsearch pypdf pandas google-cloud-aiplatform trafilatura
 
 import os, re, json, uuid, time
 from typing import List, Dict, Tuple
+from urllib.parse import urlsplit
+import urllib.robotparser as urobot
 import pandas as pd
 
 # Quiet local gRPC warnings (optional)
@@ -21,6 +39,9 @@ import vertexai
 from google.oauth2 import service_account
 from vertexai.generative_models import GenerativeModel
 from vertexai.language_models import TextEmbeddingModel
+
+# Web extraction
+import trafilatura
 
 # ----------------------------
 # 0) Config & Initialization
@@ -64,7 +85,7 @@ INDEX_SCHEMA = {
     "mappings": {
         "properties": {
             "doc_id":   {"type": "keyword"},
-            "source":   {"type": "keyword"},
+            "source":   {"type": "keyword"},   # file path or URL
             "title":    {"type": "text"},
             "text":     {"type": "text"},
             "metadata": {"type": "object"},
@@ -81,7 +102,7 @@ def ensure_index():
 ensure_index()
 
 # -----------------------
-# 2) Ingest helpers
+# 2) Ingest helpers (files)
 # -----------------------
 def read_pdf(path: str) -> str:
     reader = PdfReader(path)
@@ -100,6 +121,7 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 def sentence_chunks(text: str, size=1200, overlap=200) -> List[str]:
+    # sentence-aware chunking for cleaner context
     sents = re.split(r"(?<=[.!?])\s+", text)
     chunks, cur = [], ""
     for s in sents:
@@ -163,6 +185,78 @@ def ingest_path(path: str, title: str = None, meta: Dict = None) -> str:
         raise RuntimeError("File produced no chunks (empty text or parse issue).")
     return index_chunks(title, path, chunks, meta)
 
+# -----------------------
+# 2b) Web Ingest Agent (URLs)
+# -----------------------
+USER_AGENT = "HealthLensBot/0.1 (+contact: you@example.com)"
+ROBOTS_CACHE: Dict[str, urobot.RobotFileParser] = {}
+
+def robots_ok(url: str) -> bool:
+    """Respect robots.txt for the given URL (best-effort; fail-open if missing)."""
+    try:
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.netloc:
+            return True
+        robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
+        rp = ROBOTS_CACHE.get(robots_url)
+        if rp is None:
+            rp = urobot.RobotFileParser()
+            rp.set_url(robots_url)
+            try:
+                rp.read()
+            except Exception:
+                # Couldn't read robots; many sites omit it. Allow by default.
+                ROBOTS_CACHE[robots_url] = rp
+                return True
+            ROBOTS_CACHE[robots_url] = rp
+        # If parser has no entries, allow; else check.
+        try:
+            return rp.can_fetch(USER_AGENT, url)
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+def fetch_clean(url: str) -> str:
+    """Fetch a URL and extract main text with trafilatura."""
+    downloaded = trafilatura.fetch_url(url, no_ssl=True)
+    if not downloaded:
+        return ""
+    text = trafilatura.extract(
+        downloaded,
+        include_comments=False,
+        include_tables=False,
+        include_links=False,
+        favor_recall=True,
+        include_formatting=False,
+        url=url,
+    )
+    return (text or "").strip()
+
+def ingest_url(url: str, meta: Dict) -> str:
+    if not robots_ok(url):
+        raise RuntimeError(f"Blocked by robots.txt: {url}")
+    content = fetch_clean(url)
+    if not content:
+        raise RuntimeError(f"No extractable text at {url}")
+    title = url  # keep simple; could parse <title> if desired
+    chunks = sentence_chunks(clean_text(content), CHUNK_SIZE, CHUNK_OVERLAP)
+    if not chunks:
+        raise RuntimeError(f"Page produced no chunks: {url}")
+    return index_chunks(title, url, chunks, meta)
+
+def ingest_urls(urls: List[str], meta: Dict) -> Dict[str, str]:
+    """Return mapping {url: doc_id or 'ERROR: ...'}"""
+    out = {}
+    for u in urls:
+        try:
+            doc_id = ingest_url(u, meta)
+            out[u] = doc_id
+            time.sleep(0.4)  # gentle rate limit
+        except Exception as e:
+            out[u] = f"ERROR: {e}"
+    return out
+
 # --------------------
 # 3) Retrieval + LLM
 # --------------------
@@ -202,6 +296,7 @@ def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Di
     try:
         res = es.search(index=INDEX_NAME, body=body_knn)
     except Exception:
+        # Fallback if your cluster disallows top-level knn
         body_script = {
             "size": top_k,
             "query": {
@@ -340,6 +435,22 @@ def ui_ingest(file, title, region, month):
     except Exception as e:
         return f"❌ Ingest failed: {e}"
 
+def ui_ingest_urls(urls_text, region, month):
+    if not urls_text or not urls_text.strip():
+        return "Please paste one or more URLs (one per line)."
+    meta = {}
+    if region: meta["region"] = region
+    if month:  meta["month"] = month
+    urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+    results = ingest_urls(urls, meta)
+    bullets = []
+    for u, r in results.items():
+        if str(r).startswith("ERROR:"):
+            bullets.append(f"- ❌ {u} — {r}")
+        else:
+            bullets.append(f"- ✅ {u} — `doc_id={r}`")
+    return "\n".join(bullets) if bullets else "Nothing to ingest."
+
 def terms_safe(field):
     try: return terms(field) or []
     except: return []
@@ -351,13 +462,18 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
     gr.Markdown("# 🌍 HealthLens — AI Health Data Search")
 
     with gr.Tab("Upload"):
-        gr.Markdown("Upload a PDF / CSV / TXT to index it for search.")
+        gr.Markdown("**Upload a PDF / CSV / TXT** to index it for search.")
         file = gr.File(label="File")
         title = gr.Textbox(label="Title (optional)")
         region = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
         month  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
         out_u = gr.Markdown()
-        gr.Button("Ingest", variant="primary").click(ui_ingest, [file, title, region, month], [out_u])
+        gr.Button("Ingest File", variant="primary").click(ui_ingest, [file, title, region, month], [out_u])
+
+        gr.Markdown("### Or ingest from the web")
+        urls_box = gr.Textbox(lines=6, label="Web URLs (one per line)", placeholder="https://www.who.int/...\nhttps://www.cdc.gov/...")
+        out_u_urls = gr.Markdown()
+        gr.Button("Fetch & Ingest URLs", variant="secondary").click(ui_ingest_urls, [urls_box, region, month], [out_u_urls])
 
     with gr.Tab("Ask"):
         gr.Markdown("Ask a question. Optionally filter by region/month.")
@@ -371,7 +487,6 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
             with gr.Column(scale=2):
                 ans_md = gr.Markdown(elem_id="answer_md")
                 with gr.Row():
-                    # Hidden state to hold full answer for download
                     last_answer = gr.State("")
                     dl = gr.DownloadButton("⬇️ Download answer (.md)", variant="secondary")
                     dl.click(download_answer_md, inputs=[last_answer], outputs=[])
