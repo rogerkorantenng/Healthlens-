@@ -1,29 +1,14 @@
-# app.py — HealthLens (Two Tabs: Upload & Ask)
-# --------------------------------------------
-# One-file Gradio app: ingest PDFs/CSVs/TXTs -> Vertex AI embeddings -> Elastic index
-# Ask questions -> hybrid search (BM25 + kNN/script_score) -> Gemini answer with citations.
-#
-# .env keys (fill with real values):
-#   GOOGLE_APPLICATION_CREDENTIALS=C:/path/to/service-account.json
-#   VERTEX_PROJECT_ID=your-project-id
-#   VERTEX_LOCATION=us-central1
-#   VERTEX_MODEL_CHAT=gemini-1.5-flash-001
-#   VERTEX_MODEL_EMBED=text-embedding-004
-#   ELASTIC_CLOUD_ENDPOINT=https://<your-id>.<region>.elastic.cloud:443
-#   ELASTIC_API_KEY=<api_key>
-#   ELASTIC_INDEX=healthlens-docs
-#   CHUNK_SIZE=1200
-#   CHUNK_OVERLAP=200
-#   TOP_K=8
-#
-# pip install gradio python-dotenv elasticsearch pypdf pandas requests google-cloud-aiplatform
+# app.py — HealthLens (Two Tabs + Streaming + Readable Answer UI)
+# ---------------------------------------------------------------
+# Upload PDF/CSV/TXT -> Vertex AI embeddings -> Elastic index
+# Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answer
+# UI: two tabs, readable answer (big type), accordions for sources/snippets, download .md
 
-import os, re, json, uuid
+import os, re, json, uuid, time
 from typing import List, Dict, Tuple
 import pandas as pd
-import requests
 
-# quieten gRPC chatter locally
+# Quiet local gRPC warnings (optional)
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 import gradio as gr
@@ -57,9 +42,9 @@ CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "200"))
 DEFAULT_TOP_K  = int(os.getenv("TOP_K", "8"))
 
 if not (PROJECT_ID and LOCATION and KEY_PATH):
-    raise RuntimeError("Set VERTEX_PROJECT_ID / VERTEX_LOCATION / GOOGLE_APPLICATION_CREDENTIALS in .env")
+    raise RuntimeError("Missing Vertex config (.env): VERTEX_PROJECT_ID / VERTEX_LOCATION / GOOGLE_APPLICATION_CREDENTIALS")
 if not (ES_ENDPOINT and ES_API_KEY):
-    raise RuntimeError("Set ELASTIC_CLOUD_ENDPOINT / ELASTIC_API_KEY in .env")
+    raise RuntimeError("Missing Elastic config (.env): ELASTIC_CLOUD_ENDPOINT / ELASTIC_API_KEY")
 if any(c in INDEX_NAME for c in ' "*,/<>?\\|'):
     raise ValueError(f"Invalid ELASTIC_INDEX: {INDEX_NAME}")
 
@@ -114,19 +99,24 @@ def read_txt(path: str) -> str:
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
-def chunk_text(text: str, size=1200, overlap=200) -> List[str]:
-    chunks, n, i = [], len(text), 0
-    while i < n:
-        end = min(n, i + size)
-        chunk = text[i:end]
-        cut = chunk.rfind(".")
-        if cut > int(size * 0.6):
-            end = i + cut + 1
-            chunk = text[i:end]
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append(chunk)
-        i = max(end - overlap, end)
+def sentence_chunks(text: str, size=1200, overlap=200) -> List[str]:
+    sents = re.split(r"(?<=[.!?])\s+", text)
+    chunks, cur = [], ""
+    for s in sents:
+        if len(cur) + len(s) + 1 <= size:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur: chunks.append(cur)
+            cur = s
+    if cur: chunks.append(cur)
+    if overlap > 0 and chunks:
+        fused = []
+        for i, ch in enumerate(chunks):
+            if i > 0:
+                prev_tail = chunks[i-1][-overlap:]
+                ch = (prev_tail + " " + ch).strip()
+            fused.append(ch)
+        chunks = fused
     return chunks
 
 def embed(texts: List[str]) -> List[List[float]]:
@@ -168,7 +158,7 @@ def ingest_path(path: str, title: str = None, meta: Dict = None) -> str:
         raise ValueError(f"Unsupported file type: {ext}")
 
     text = clean_text(raw)
-    chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    chunks = sentence_chunks(text, CHUNK_SIZE, CHUNK_OVERLAP)
     if not chunks:
         raise RuntimeError("File produced no chunks (empty text or parse issue).")
     return index_chunks(title, path, chunks, meta)
@@ -185,6 +175,15 @@ SYSTEM_PROMPT = (
     "4) Keep it tight: 3–6 bullets + one 'Takeaway:' line.\n"
     "5) If a CSV preview appears, mention key rows/columns explicitly.\n"
 )
+
+def terms(field: str, size: int = 50) -> List[str]:
+    agg_field = f"metadata.{field}.keyword"
+    body = {"size": 0, "aggs": {"x": {"terms": {"field": agg_field, "size": size, "order": {"_key": "asc"}}}}}
+    try:
+        r = es.search(index=INDEX_NAME, body=body)
+        return [b["key"] for b in r.get("aggregations", {}).get("x", {}).get("buckets", [])]
+    except Exception:
+        return []
 
 def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Dict], float]:
     qv = embedder.get_embeddings([query])[0].values
@@ -203,7 +202,6 @@ def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Di
     try:
         res = es.search(index=INDEX_NAME, body=body_knn)
     except Exception:
-        # Fallback if top-level knn is not allowed on your cluster
         body_script = {
             "size": top_k,
             "query": {
@@ -230,65 +228,104 @@ def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Di
         })
     return ctx, float(max_score)
 
-def answer_query(user_query: str, top_k: int, filters: Dict = None) -> Tuple[str, str, str]:
-    ctx, max_score = hybrid_search(user_query, top_k, filters)
-    if not ctx:
-        return "No relevant context found. Please upload more reports.", "_No sources._", "_No snippets._"
+def make_clickable(src: str) -> str:
+    s = (src or "").strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return f"[{s}]({s})"
+    return f"`{s}`"
 
-    # Build context block for LLM
-    ctx_block = ""
-    for i, c in enumerate(ctx, 1):
-        ctx_block += (
-            f"\n[CTX {i}] Title: {c['title']}\n"
-            f"Source: {c['source']}\n"
-            f"Meta: {c.get('metadata', {})}\n"
-            f"Text: {c['text']}\n"
-        )
-
-    generation_config = {"temperature": 0.2, "max_output_tokens": 800, "top_p": 0.9}
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\nUser question: {user_query}\n\n"
-        f"Context snippets:\n{ctx_block}\n\n"
-        "Output:\n- 3–6 bullets\n- 'Takeaway:' line\n- Inline citations after each bullet\n"
-    )
-    resp = llm.generate_content(prompt, generation_config=generation_config)
-    answer_md = (resp.text or "")
-
-    # Sources list
-    seen, sources = set(), []
+# ---------- Streaming generator with readable layout ----------
+def build_sources_md(ctx: List[Dict]) -> str:
+    seen, lines = set(), []
     for c in ctx:
         key = (c["title"], c["source"])
         if key not in seen:
             seen.add(key)
-            sources.append(f"- **{c['title']}** — `{c['source']}`")
-    sources_md = "\n".join(sources) if sources else "_No sources._"
+            lines.append(f"- **{c['title']}** — {make_clickable(c['source'])}")
+    return "### Sources\n" + ("\n".join(lines) if lines else "_No sources._")
 
-    # Snippet previews
-    def hi(txt: str, q: str) -> str:
-        terms = [t for t in re.findall(r"\w+", q.lower()) if len(t) > 3]
-        out = txt
-        for t in set(terms):
-            out = re.sub(fr"(?i)\b({re.escape(t)})\b", r"**\1**", out)
-        return out
+def bold_terms(text: str, query: str) -> str:
+    terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 3]
+    out = text
+    for t in set(terms):
+        out = re.sub(fr"(?i)\b({re.escape(t)})\b", r"**\1**", out)
+    return out
+
+def build_snippets_md(ctx: List[Dict], query: str, n=3) -> str:
     parts = []
-    for c in ctx[:3]:
+    for c in ctx[:n]:
         snippet = c["text"]
         snippet = (snippet[:600] + "…") if len(snippet) > 600 else snippet
-        parts.append(f"**{c['title']}**  \n{hi(snippet, user_query)}  \n`{c['source']}`")
-    snippets_md = "\n\n---\n\n".join(parts) if parts else "_No snippets._"
+        parts.append(f"**{c['title']}**  \n{bold_terms(snippet, query)}  \n{make_clickable(c['source'])}")
+    return "### Top Snippets\n" + ("\n\n---\n\n".join(parts) if parts else "_No snippets._")
 
-    # add a light confidence hint (heuristic)
-    conf = "high" if max_score >= 2.0 else ("medium" if max_score >= 1.0 else "low")
-    answer_md = f"**Confidence:** {conf}\n\n" + answer_md
+def stream_answer(user_query: str, region: str, month: str, top_k: int, last_answer_state: str):
+    try:
+        top_k = int(top_k)
+        filters = {"region": region or None, "month": month or None}
+        ctx, max_score = hybrid_search(user_query, top_k, filters)
 
-    return answer_md, f"### Sources\n{sources_md}", f"### Top Snippets\n{snippets_md}"
+        if not ctx:
+            yield ("No relevant context found. Please upload more reports.", "_No sources._", "_No snippets._", "")
+            return
 
-# --------------
-# 4) Gradio UI (TWO TABS)
-# --------------
+        sources_md  = build_sources_md(ctx)
+        snippets_md = build_snippets_md(ctx, user_query, n=3)
+
+        conf = "high" if max_score >= 2.0 else ("medium" if max_score >= 1.0 else "low")
+        answer_prefix = f"### Answer  \n<span class='badge'>confidence: {conf}</span>\n\n"
+
+        # Build context for the LLM
+        ctx_block = ""
+        for i, c in enumerate(ctx, 1):
+            ctx_block += (
+                f"\n[CTX {i}] Title: {c['title']}\n"
+                f"Source: {c['source']}\n"
+                f"Meta: {c.get('metadata', {})}\n"
+                f"Text: {c['text']}\n"
+            )
+
+        generation_config = {"temperature": 0.2, "max_output_tokens": 800, "top_p": 0.9}
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\nUser question: {user_query}\n\n"
+            f"Context snippets:\n{ctx_block}\n\n"
+            "Output:\n- 3–6 bullets\n- 'Takeaway:' line\n- Inline citations after each bullet\n"
+        )
+
+        # First yield: show header + empty body so right column renders immediately
+        current = answer_prefix
+        yield (current, sources_md, snippets_md, current)
+
+        # Stream tokens
+        for chunk in llm.generate_content(prompt, generation_config=generation_config, stream=True):
+            token = getattr(chunk, "text", None)
+            if token:
+                current += token
+                yield (current, sources_md, snippets_md, current)
+
+    except Exception as e:
+        yield (f"❌ Query error: {e}", "", "", "")
+
+# Download helper
+def download_answer_md(answer_text: str):
+    if not answer_text:
+        return None
+    path = f"healthlens_answer_{int(time.time())}.md"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(answer_text)
+    return path
+
+# --------------------
+# 4) Gradio UI (Two Tabs, readable)
+# --------------------
 THEME = gr.themes.Soft(primary_hue="blue")
 CSS = """
 footer {visibility: hidden}
+#answer_md * {font-size: 1.05rem; line-height: 1.75;}
+#answer_md ul {margin-left: 1.15rem; margin-top: .25rem;}
+#answer_md li {margin: .18rem 0;}
+#answer_md a {color: #64748b; text-decoration: none;}
+.badge {display:inline-block;padding:4px 10px;border-radius:999px;background:#0ea5e9;color:white;font-size:12px;margin-left:8px}
 """
 
 def ui_ingest(file, title, region, month):
@@ -303,25 +340,22 @@ def ui_ingest(file, title, region, month):
     except Exception as e:
         return f"❌ Ingest failed: {e}"
 
-def ui_ask(question, region, month, top_k):
-    if not question or not question.strip():
-        return "Please type a question.", "", ""
-    filters = {"region": region or None, "month": month or None}
-    try:
-        ans_md, sources_md, snippets_md = answer_query(question, int(top_k), filters)
-        return ans_md, sources_md, snippets_md
-    except Exception as e:
-        return f"❌ Query error: {e}", "", ""
+def terms_safe(field):
+    try: return terms(field) or []
+    except: return []
+
+REGIONS = terms_safe("region")
+MONTHS  = terms_safe("month")
 
 with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
-    gr.Markdown("# 🌍 HealthLens — AI Health Data Search\nTwo tabs: **Upload** and **Ask**.")
+    gr.Markdown("# 🌍 HealthLens — AI Health Data Search")
 
     with gr.Tab("Upload"):
         gr.Markdown("Upload a PDF / CSV / TXT to index it for search.")
         file = gr.File(label="File")
         title = gr.Textbox(label="Title (optional)")
-        region = gr.Textbox(label="Region (optional)", placeholder="e.g., Northern")
-        month  = gr.Textbox(label="Month (optional, e.g., 2025-07)")
+        region = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
+        month  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
         out_u = gr.Markdown()
         gr.Button("Ingest", variant="primary").click(ui_ingest, [file, title, region, month], [out_u])
 
@@ -329,13 +363,30 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
         gr.Markdown("Ask a question. Optionally filter by region/month.")
         q = gr.Textbox(label="Your question", placeholder="e.g., When was the initial alert received?")
         topk = gr.Slider(3, 20, value=DEFAULT_TOP_K, step=1, label="Top-K passages")
-        region_q = gr.Textbox(label="Region filter (optional)")
-        month_q  = gr.Textbox(label="Month filter (optional, e.g., 2025-07)")
-        out_a = gr.Markdown()
-        out_src = gr.Markdown()
-        out_snip = gr.Markdown()
-        gr.Button("Ask", variant="primary").click(
-            ui_ask, [q, region_q, month_q, topk], [out_a, out_src, out_snip]
+        region_q = gr.Dropdown(choices=REGIONS, label="Region filter (optional)", allow_custom_value=True)
+        month_q  = gr.Dropdown(choices=MONTHS,  label="Month filter (optional, e.g., 2025-07)", allow_custom_value=True)
+
+        # Two-column readable layout
+        with gr.Row():
+            with gr.Column(scale=2):
+                ans_md = gr.Markdown(elem_id="answer_md")
+                with gr.Row():
+                    # Hidden state to hold full answer for download
+                    last_answer = gr.State("")
+                    dl = gr.DownloadButton("⬇️ Download answer (.md)", variant="secondary")
+                    dl.click(download_answer_md, inputs=[last_answer], outputs=[])
+
+            with gr.Column(scale=1):
+                with gr.Accordion("Sources", open=True):
+                    out_src = gr.Markdown()
+                with gr.Accordion("Top Snippets", open=False):
+                    out_snip = gr.Markdown()
+
+        # STREAMING: function yields (answer, sources, snippets, state)
+        gr.Button("Ask (Streaming)", variant="primary").click(
+            fn=stream_answer,
+            inputs=[q, region_q, month_q, topk, last_answer],
+            outputs=[ans_md, out_src, out_snip, last_answer],
         )
 
 if __name__ == "__main__":
