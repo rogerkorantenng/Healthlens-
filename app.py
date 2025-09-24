@@ -1,21 +1,37 @@
-# app.py — HealthLens (Streaming + Readable UI + Web Ingest Agent + Nice Loading UX)
-# ----------------------------------------------------------------------------------
+# app.py — HealthLens (Streaming + Sticky Ask + Web Ingest + Shallow Crawler + Live Crawl Progress)
+# -----------------------------------------------------------------------------------------------
 # Upload PDF/CSV/TXT or paste URLs -> Vertex AI embeddings -> Elasticsearch (serverless-safe)
+# Crawl (shallow BFS) -> respects robots.txt -> ingest pages, with live progress streaming
 # Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answer with citations & snippets
-# UX: Buttons show loading, disable during work, status text, and auto-scroll to answer area.
+#
+# .env (use forward slashes on Windows paths):
+#   GOOGLE_APPLICATION_CREDENTIALS=C:/path/to/service-account.json
+#   VERTEX_PROJECT_ID=your-project-id
+#   VERTEX_LOCATION=us-central1
+#   VERTEX_MODEL_CHAT=gemini-1.5-flash-001
+#   VERTEX_MODEL_EMBED=text-embedding-004
+#   ELASTIC_CLOUD_ENDPOINT=https://<your-id>.<region>.elastic.cloud:443
+#   ELASTIC_API_KEY=<api_key>
+#   ELASTIC_INDEX=healthlens-docs
+#   CHUNK_SIZE=1200
+#   CHUNK_OVERLAP=200
+#   TOP_K=8
 
 import os, re, json, uuid, time
-from typing import List, Dict, Tuple
-from urllib.parse import urlsplit
+from typing import List, Dict, Tuple, Optional
+from collections import deque
+from urllib.parse import urlsplit, urljoin, urldefrag
 import urllib.robotparser as urobot
 import pandas as pd
 
+# Quiet local gRPC warnings (optional)
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 import gradio as gr
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch, helpers
 from pypdf import PdfReader
+from bs4 import BeautifulSoup
 
 # Vertex AI
 import vertexai
@@ -104,6 +120,7 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 def sentence_chunks(text: str, size=1200, overlap=200) -> List[str]:
+    # sentence-aware chunking for cleaner context
     sents = re.split(r"(?<=[.!?])\s+", text)
     chunks, cur = [], ""
     for s in sents:
@@ -198,6 +215,7 @@ def robots_ok(url: str) -> bool:
         return True
 
 def fetch_clean(url: str) -> str:
+    """Fetch a URL and extract main text with trafilatura."""
     downloaded = trafilatura.fetch_url(url, no_ssl=True)
     if not downloaded:
         return ""
@@ -234,6 +252,120 @@ def ingest_urls(urls: List[str], meta: Dict) -> Dict[str, str]:
         except Exception as e:
             out[u] = f"ERROR: {e}"
     return out
+
+# --------- UI wrapper for Web URLs (MISSING BEFORE — now added) ----------
+def ui_ingest_urls(urls_text, region, month):
+    """Web ingest UI wrapper: parse textarea -> call ingest_urls(url_list, meta)."""
+    if not urls_text or not urls_text.strip():
+        return "Please paste one or more URLs (one per line)."
+    urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+    meta = {}
+    if region: meta["region"] = region
+    if month:  meta["month"]  = month
+    results = ingest_urls(urls, meta)
+    lines = []
+    for u, r in results.items():
+        if str(r).startswith("ERROR:"):
+            lines.append(f"- ❌ {u} — {r}")
+        else:
+            lines.append(f"- ✅ {u} — `doc_id={r}`")
+    return "\n".join(lines) if lines else "Nothing to ingest."
+
+# -----------------------
+# Shallow Crawler helpers
+# -----------------------
+def _normalize_url(href: str, base: str) -> Optional[str]:
+    """Make absolute, drop fragments, keep http(s) only."""
+    if not href:
+        return None
+    absu = urljoin(base, href.strip())
+    absu, _ = urldefrag(absu)  # remove #fragment
+    parts = urlsplit(absu)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    host = parts.netloc.lower()
+    scheme = parts.scheme.lower()
+    path = parts.path or "/"
+    q = f"?{parts.query}" if parts.query else ""
+    return f"{scheme}://{host}{path}{q}"
+
+def _same_domain(u1: str, u2: str) -> bool:
+    try:
+        return urlsplit(u1).netloc.lower() == urlsplit(u2).netloc.lower()
+    except Exception:
+        return False
+
+def _extract_links(html: str, base_url: str) -> List[str]:
+    """Pull <a href>, absolutize, basic dedupe."""
+    out = []
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        for a in soup.find_all("a", href=True):
+            u = _normalize_url(a["href"], base_url)
+            if u:
+                out.append(u)
+    except Exception:
+        pass
+    seen, deduped = set(), []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    return deduped
+
+def crawl_site(seeds: List[str], same_domain_only: bool, max_pages: int, max_depth: int,
+               allow_re: Optional[str] = None, deny_re: Optional[str] = None) -> List[str]:
+    """
+    BFS crawl. Returns list of URLs to ingest (visited pages).
+    """
+    allow_pat = re.compile(allow_re) if (allow_re or "").strip() else None
+    deny_pat  = re.compile(deny_re)  if (deny_re  or "").strip() else None
+
+    visited: set[str] = set()
+    queue: deque[Tuple[str, int]] = deque()
+    to_ingest: List[str] = []
+
+    # seed queue
+    for s in seeds:
+        u = _normalize_url(s, s)
+        if u:
+            queue.append((u, 0))
+
+    while queue and len(to_ingest) < max_pages:
+        url, depth = queue.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+
+        if not robots_ok(url):
+            continue
+
+        # fetch raw HTML for link extraction
+        html = trafilatura.fetch_url(url, no_ssl=True)
+        if not html:
+            continue
+
+        # mark this page to ingest
+        to_ingest.append(url)
+
+        # expand links if depth allows
+        if depth < max_depth:
+            links = _extract_links(html, url)
+            for link in links:
+                if same_domain_only and not _same_domain(link, url):
+                    continue
+                if allow_pat and not allow_pat.search(link):
+                    continue
+                if deny_pat and deny_pat.search(link):
+                    continue
+                if link not in visited:
+                    queue.append((link, depth + 1))
+
+        time.sleep(0.3)
+        if len(to_ingest) >= max_pages:
+            break
+
+    return to_ingest
 
 # --------------------
 # 3) Retrieval + LLM
@@ -274,6 +406,7 @@ def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Di
     try:
         res = es.search(index=INDEX_NAME, body=body_knn)
     except Exception:
+        # Fallback if your cluster disallows top-level knn
         body_script = {
             "size": top_k,
             "query": {
@@ -347,6 +480,7 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
         conf = "high" if max_score >= 2.0 else ("medium" if max_score >= 1.0 else "low")
         answer_prefix = f"### Answer  \n<span class='badge'>confidence: {conf}</span>\n\n"
 
+        # Build context for the LLM
         ctx_block = ""
         for i, c in enumerate(ctx, 1):
             ctx_block += (
@@ -363,9 +497,11 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
             "Output:\n- 3–6 bullets\n- 'Takeaway:' line\n- Inline citations after each bullet\n"
         )
 
+        # First yield: show header + empty body so right column renders immediately
         current = answer_prefix
         yield (current, sources_md, snippets_md, current)
 
+        # Stream tokens
         for chunk in llm.generate_content(prompt, generation_config=generation_config, stream=True):
             token = getattr(chunk, "text", None)
             if token:
@@ -375,6 +511,7 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
     except Exception as e:
         yield (f"❌ Query error: {e}", "", "", "")
 
+# Download helper
 def download_answer_md(answer_text: str):
     if not answer_text:
         return None
@@ -384,7 +521,122 @@ def download_answer_md(answer_text: str):
     return path
 
 # --------------------
-# 4) Gradio UI (Two Tabs, readable, with loading UX)
+# 3b) Streaming crawl UI handler (live progress)
+# --------------------
+def ui_crawl_stream(seeds_text, same_domain_only, max_pages, max_depth, allow_re, deny_re, region, month):
+    """Stream crawl progress with a final full list of all crawled pages."""
+    if not seeds_text or not seeds_text.strip():
+        yield "Please enter at least one seed URL."
+        return
+
+    # Parse inputs
+    seeds = [s.strip() for s in seeds_text.splitlines() if s.strip()]
+    try:
+        max_pages = int(max_pages)
+        max_depth = int(max_depth)
+    except Exception:
+        yield "Max pages/depth must be numbers."
+        return
+
+    # Tagging
+    meta = {}
+    if region: meta["region"] = region
+    if month:  meta["month"] = month
+
+    # Compile filters
+    allow_pat = re.compile(allow_re) if (allow_re or "").strip() else None
+    deny_pat  = re.compile(deny_re)  if (deny_re  or "").strip() else None
+
+    # BFS setup
+    visited_set: set[str] = set()
+    visited_list: list[str] = []  # keep order for final report
+    queue: deque[tuple[str, int]] = deque()
+    for s in seeds:
+        u = _normalize_url(s, s)
+        if u:
+            queue.append((u, 0))
+
+    crawled = 0
+    ok_urls: list[str] = []
+    err_list: list[tuple[str, str]] = []  # (url, error)
+
+    log_lines = [f"⏳ Starting crawl with {len(seeds)} seed(s)…  ",
+                 f"**Max pages:** {max_pages} • **Max depth:** {max_depth} • **Same domain:** {bool(same_domain_only)}"]
+    yield "\n".join(log_lines)
+
+    while queue and crawled < max_pages:
+        url, depth = queue.popleft()
+        if url in visited_set:
+            continue
+        visited_set.add(url)
+        visited_list.append(url)
+
+        # robots
+        if not robots_ok(url):
+            log_lines.append(f"- 🚫 Blocked by robots.txt: {url}")
+            yield "\n".join(log_lines)
+            continue
+
+        # fetch raw HTML (for links)
+        html = trafilatura.fetch_url(url, no_ssl=True)
+        if not html:
+            log_lines.append(f"- ⚠️ No HTML content: {url}")
+            yield "\n".join(log_lines)
+            continue
+
+        # Ingest this page
+        try:
+            doc_id = ingest_url(url, meta)
+            crawled += 1
+            ok_urls.append(url)
+            log_lines.append(f"{crawled}. ✅ Ingested (depth {depth}) — {url}  \n`doc_id={doc_id}`")
+        except Exception as e:
+            crawled += 1
+            err_list.append((url, str(e)))
+            log_lines.append(f"{crawled}. ❌ Failed (depth {depth}) — {url}  \n`{e}`")
+
+        # Expand links if depth allows
+        if depth < max_depth:
+            for link in _extract_links(html, url):
+                if same_domain_only and not _same_domain(link, url):
+                    continue
+                if allow_pat and not allow_pat.search(link):
+                    continue
+                if deny_pat and deny_pat.search(link):
+                    continue
+                if link not in visited_set:
+                    queue.append((link, depth + 1))
+
+        time.sleep(0.3)  # be polite
+        yield "\n".join(log_lines)  # accumulate output so far
+
+        if crawled >= max_pages:
+            break
+
+    # Final full report
+    log_lines.append("")
+    # log_lines.append(f"**Done.** Visited: {len(visited_list)} • Ingested OK: {len(ok_urls)} • Errors: {len(err_list)}")
+    log_lines.append("")
+    for i, u in enumerate(visited_list, 1):
+        log_lines.append(f"{i}. {u}")
+
+    if ok_urls:
+        log_lines.append("")
+        # log_lines.append(f"### Ingested OK ({len(ok_urls)})")
+        for u in ok_urls:
+            log_lines.append(f"- {u}")
+
+    if err_list:
+        log_lines.append("")
+        # log_lines.append(f"### Errors ({len(err_list)})")
+        for u, e in err_list:
+            log_lines.append(f"- {u} — `{e}`")
+
+    yield "\n".join(log_lines)
+
+
+# --------------------
+# 4) Gradio UI (Two Tabs, sticky ask, loading UX, Upload sub-tabs)
 # --------------------
 THEME = gr.themes.Soft(primary_hue="blue")
 CSS = """
@@ -408,7 +660,6 @@ footer {visibility: hidden}
 }
 """
 
-
 def ui_ingest(file, title, region, month):
     if file is None:
         return "Please upload a PDF/CSV/TXT."
@@ -421,22 +672,6 @@ def ui_ingest(file, title, region, month):
     except Exception as e:
         return f"❌ Ingest failed: {e}"
 
-def ui_ingest_urls(urls_text, region, month):
-    if not urls_text or not urls_text.strip():
-        return "Please paste one or more URLs (one per line)."
-    meta = {}
-    if region: meta["region"] = region
-    if month:  meta["month"] = month
-    urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
-    results = ingest_urls(urls, meta)
-    bullets = []
-    for u, r in results.items():
-        if str(r).startswith("ERROR:"):
-            bullets.append(f"- ❌ {u} — {r}")
-        else:
-            bullets.append(f"- ✅ {u} — `doc_id={r}`")
-    return "\n".join(bullets) if bullets else "Nothing to ingest."
-
 def terms_safe(field):
     try: return terms(field) or []
     except: return []
@@ -447,50 +682,106 @@ MONTHS  = terms_safe("month")
 with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
     gr.Markdown("# 🌍 HealthLens — AI Health Data Search")
 
+    # ---------------------------
+    # Upload (with sub-tabs)
+    # ---------------------------
     with gr.Tab("Upload"):
-        gr.Markdown("**Upload a PDF / CSV / TXT** to index it for search.")
-        file = gr.File(label="File")
-        title = gr.Textbox(label="Title (optional)")
-        region = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
-        month  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
-        upload_status = gr.Markdown(elem_classes=["status"])
-        out_u = gr.Markdown()
-        ingest_btn = gr.Button("Ingest File", variant="primary")
+        gr.Markdown("Manage your corpus via file upload, direct URLs, or a shallow crawl.")
 
-        # Loading UX for file ingest
-        ingest_btn.click(
-            lambda: (gr.update(value="Ingesting…", interactive=False), "⏳ Ingesting file…"),
-            inputs=[],
-            outputs=[ingest_btn, upload_status],
-        ).then(
-            ui_ingest, [file, title, region, month], [out_u]
-        ).then(
-            lambda: (gr.update(value="Ingest File", interactive=True), ""),
-            inputs=[],
-            outputs=[ingest_btn, upload_status],
-        )
+        with gr.Tabs():
+            # Sub-tab 1: Upload a file
+            with gr.TabItem("Upload a PDF / CSV / TXT"):
+                file = gr.File(label="File")
+                title = gr.Textbox(label="Title (optional)")
+                region_file = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
+                month_file  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
 
-        gr.Markdown("### Or ingest from the web")
-        urls_box = gr.Textbox(lines=6, label="Web URLs (one per line)", placeholder="https://www.who.int/...\nhttps://www.cdc.gov/...")
-        upload_status_urls = gr.Markdown(elem_classes=["status"])
-        out_u_urls = gr.Markdown()
-        ingest_urls_btn = gr.Button("Fetch & Ingest URLs", variant="secondary")
+                status_file = gr.Markdown(elem_classes=["status"])
+                out_file = gr.Markdown()
+                btn_file = gr.Button("Ingest File", variant="primary")
 
-        # Loading UX for URL ingest
-        ingest_urls_btn.click(
-            lambda: (gr.update(value="Fetching…", interactive=False), "⏳ Fetching pages…"),
-            inputs=[],
-            outputs=[ingest_urls_btn, upload_status_urls],
-        ).then(
-            ui_ingest_urls, [urls_box, region, month], [out_u_urls]
-        ).then(
-            lambda: (gr.update(value="Fetch & Ingest URLs", interactive=True), ""),
-            inputs=[],
-            outputs=[ingest_urls_btn, upload_status_urls],
-        )
+                # Loading UX for file ingest
+                btn_file.click(
+                    lambda: (gr.update(value="Ingesting…", interactive=False), "⏳ Ingesting file…"),
+                    inputs=[],
+                    outputs=[btn_file, status_file],
+                ).then(
+                    lambda f, t, r, m: ui_ingest(f, t, r, m), [file, title, region_file, month_file], [out_file]
+                ).then(
+                    lambda: (gr.update(value="Ingest File", interactive=True), ""),
+                    inputs=[],
+                    outputs=[btn_file, status_file],
+                )
 
+            # Sub-tab 2: Ingest from the Web
+            with gr.TabItem("Ingest from the Web"):
+                urls_box = gr.Textbox(
+                    lines=6,
+                    label="Web URLs (one per line)",
+                    placeholder="https://www.who.int/...\nhttps://www.cdc.gov/..."
+                )
+                region_web = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
+                month_web  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
+
+                status_web = gr.Markdown(elem_classes=["status"])
+                out_web = gr.Markdown()
+                btn_web = gr.Button("Fetch & Ingest URLs", variant="secondary")
+
+                # Loading UX for URL ingest
+                btn_web.click(
+                    lambda: (gr.update(value="Fetching…", interactive=False), "⏳ Fetching pages…"),
+                    inputs=[],
+                    outputs=[btn_web, status_web],
+                ).then(
+                    ui_ingest_urls, [urls_box, region_web, month_web], [out_web]
+                ).then(
+                    lambda: (gr.update(value="Fetch & Ingest URLs", interactive=True), ""),
+                    inputs=[],
+                    outputs=[btn_web, status_web],
+                )
+
+            # Sub-tab 3: Crawl a Site (shallow, live progress)
+            with gr.TabItem("Crawl a Site (shallow)"):
+                crawl_seeds = gr.Textbox(
+                    lines=4,
+                    label="Seed URL(s) — one per line",
+                    placeholder="https://www.who.int/emergencies/disease-outbreak-news\nhttps://www.cdc.gov/outbreaks/",
+                )
+                with gr.Row():
+                    crawl_same = gr.Checkbox(value=True, label="Limit to same domain")
+                    crawl_max_pages = gr.Slider(5, 200, value=30, step=1, label="Max pages")
+                    crawl_max_depth = gr.Slider(0, 3, value=1, step=1, label="Max depth (clicks)")
+                with gr.Row():
+                    crawl_allow = gr.Textbox(label="Allow (regex, optional)", placeholder=r"^https?://([a-z0-9-]+\.)?example\.com/")
+                    crawl_deny  = gr.Textbox(label="Deny (regex, optional)",  placeholder=r"\.pdf$|/amp/")
+
+                region_crawl = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
+                month_crawl  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
+
+                status_crawl = gr.Markdown(elem_classes=["status"])
+                out_crawl = gr.Markdown()
+                btn_crawl = gr.Button("Crawl & Ingest", variant="secondary")
+
+                # Loading UX + streaming progress + auto-scroll to output
+                btn_crawl.click(
+                    lambda: (gr.update(value="Crawling…", interactive=False), "⏳ Crawling site(s)…"),
+                    inputs=[],
+                    outputs=[btn_crawl, status_crawl],
+                    scroll_to_output=True,
+                ).then(
+                    ui_crawl_stream,
+                    inputs=[crawl_seeds, crawl_same, crawl_max_pages, crawl_max_depth, crawl_allow, crawl_deny, region_crawl, month_crawl],
+                    outputs=[out_crawl],
+                ).then(
+                    lambda: (gr.update(value="Crawl & Ingest", interactive=True), ""),
+                    inputs=[],
+                    outputs=[btn_crawl, status_crawl],
+                )
+
+    # ---------------------------
+    # Ask (sticky bar + streaming)
+    # ---------------------------
     with gr.Tab("Ask"):
-        # Sticky ask bar
         with gr.Column(elem_id="ask_bar"):
             gr.Markdown("Ask a question. Optionally filter by region/month.")
             with gr.Row():
@@ -498,9 +789,8 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
                 ask_btn = gr.Button("Ask (Streaming)", variant="primary", scale=2)
             with gr.Row():
                 region_q = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True, scale=3)
-                month_q = gr.Dropdown(choices=MONTHS, label="Month (optional, e.g., 2025-07)", allow_custom_value=True,
-                                      scale=3)
-                topk = gr.Slider(3, 20, value=DEFAULT_TOP_K, step=1, label="Top-K", scale=4)
+                month_q  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True, scale=3)
+                topk     = gr.Slider(3, 20, value=DEFAULT_TOP_K, step=1, label="Top-K", scale=4)
             ask_status = gr.Markdown(elem_classes=["status"])
 
         # Content below (scrolls under the sticky bar)
@@ -517,26 +807,18 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
                 with gr.Accordion("Top Snippets", open=False):
                     out_snip = gr.Markdown()
 
-        # Smooth-scroll to the answer area (optional; sticky ask stays visible)
-        scroll_js = """
-    () => {
-      const el = document.getElementById('answer_md');
-      if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
-    }
-        """.strip()
-
-        # Loading UX for Ask: disable + label + status + scroll; then stream; then reset
+        # Loading UX for Ask: disable + label + status; then stream; then reset
         ask_btn.click(
             lambda: (gr.update(value="Thinking…", interactive=False), "⏳ Generating…"),
             inputs=[],
             outputs=[ask_btn, ask_status],
-            scroll_to_output=True,  # auto-scrolls to first output
+            scroll_to_output=True,  # auto-scrolls to the first output (ans_md)
         ).then(
             fn=stream_answer,
             inputs=[q, region_q, month_q, topk, last_answer],
             outputs=[ans_md, out_src, out_snip, last_answer],
         ).then(
-            lambda: (gr.update(value="Ask", interactive=True), ""),
+            lambda: (gr.update(value="Ask (Streaming)", interactive=True), ""),
             inputs=[],
             outputs=[ask_btn, ask_status],
         )
