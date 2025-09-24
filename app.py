@@ -1,24 +1,8 @@
-# app.py — HealthLens (Two Tabs + Streaming + Readable UI + Web Ingest Agent)
-# ---------------------------------------------------------------------------
-# Upload PDF/CSV/TXT -> Vertex AI embeddings -> Elasticsearch (serverless-safe)
-# Paste URLs -> Agent fetches pages (robots-aware) -> cleans text -> chunks -> embeds -> indexes
-# Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answers
-#
-# .env (use forward slashes on Windows paths):
-#   GOOGLE_APPLICATION_CREDENTIALS=C:/path/to/service-account.json
-#   VERTEX_PROJECT_ID=your-project-id
-#   VERTEX_LOCATION=us-central1
-#   VERTEX_MODEL_CHAT=gemini-1.5-flash-001
-#   VERTEX_MODEL_EMBED=text-embedding-004
-#   ELASTIC_CLOUD_ENDPOINT=https://<your-id>.<region>.elastic.cloud:443
-#   ELASTIC_API_KEY=<api_key>
-#   ELASTIC_INDEX=healthlens-docs
-#   CHUNK_SIZE=1200
-#   CHUNK_OVERLAP=200
-#   TOP_K=8
-#
-# Install:
-#   pip install gradio python-dotenv elasticsearch pypdf pandas google-cloud-aiplatform trafilatura
+# app.py — HealthLens (Streaming + Readable UI + Web Ingest Agent + Nice Loading UX)
+# ----------------------------------------------------------------------------------
+# Upload PDF/CSV/TXT or paste URLs -> Vertex AI embeddings -> Elasticsearch (serverless-safe)
+# Ask -> hybrid search (BM25 + kNN/script_score) -> Gemini **streamed** answer with citations & snippets
+# UX: Buttons show loading, disable during work, status text, and auto-scroll to answer area.
 
 import os, re, json, uuid, time
 from typing import List, Dict, Tuple
@@ -26,7 +10,6 @@ from urllib.parse import urlsplit
 import urllib.robotparser as urobot
 import pandas as pd
 
-# Quiet local gRPC warnings (optional)
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 import gradio as gr
@@ -121,7 +104,6 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 def sentence_chunks(text: str, size=1200, overlap=200) -> List[str]:
-    # sentence-aware chunking for cleaner context
     sents = re.split(r"(?<=[.!?])\s+", text)
     chunks, cur = [], ""
     for s in sents:
@@ -205,11 +187,9 @@ def robots_ok(url: str) -> bool:
             try:
                 rp.read()
             except Exception:
-                # Couldn't read robots; many sites omit it. Allow by default.
                 ROBOTS_CACHE[robots_url] = rp
                 return True
             ROBOTS_CACHE[robots_url] = rp
-        # If parser has no entries, allow; else check.
         try:
             return rp.can_fetch(USER_AGENT, url)
         except Exception:
@@ -218,7 +198,6 @@ def robots_ok(url: str) -> bool:
         return True
 
 def fetch_clean(url: str) -> str:
-    """Fetch a URL and extract main text with trafilatura."""
     downloaded = trafilatura.fetch_url(url, no_ssl=True)
     if not downloaded:
         return ""
@@ -239,20 +218,19 @@ def ingest_url(url: str, meta: Dict) -> str:
     content = fetch_clean(url)
     if not content:
         raise RuntimeError(f"No extractable text at {url}")
-    title = url  # keep simple; could parse <title> if desired
+    title = url
     chunks = sentence_chunks(clean_text(content), CHUNK_SIZE, CHUNK_OVERLAP)
     if not chunks:
         raise RuntimeError(f"Page produced no chunks: {url}")
     return index_chunks(title, url, chunks, meta)
 
 def ingest_urls(urls: List[str], meta: Dict) -> Dict[str, str]:
-    """Return mapping {url: doc_id or 'ERROR: ...'}"""
     out = {}
     for u in urls:
         try:
             doc_id = ingest_url(u, meta)
             out[u] = doc_id
-            time.sleep(0.4)  # gentle rate limit
+            time.sleep(0.4)
         except Exception as e:
             out[u] = f"ERROR: {e}"
     return out
@@ -296,7 +274,6 @@ def hybrid_search(query: str, top_k: int, filters: Dict = None) -> Tuple[List[Di
     try:
         res = es.search(index=INDEX_NAME, body=body_knn)
     except Exception:
-        # Fallback if your cluster disallows top-level knn
         body_script = {
             "size": top_k,
             "query": {
@@ -370,7 +347,6 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
         conf = "high" if max_score >= 2.0 else ("medium" if max_score >= 1.0 else "low")
         answer_prefix = f"### Answer  \n<span class='badge'>confidence: {conf}</span>\n\n"
 
-        # Build context for the LLM
         ctx_block = ""
         for i, c in enumerate(ctx, 1):
             ctx_block += (
@@ -387,11 +363,9 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
             "Output:\n- 3–6 bullets\n- 'Takeaway:' line\n- Inline citations after each bullet\n"
         )
 
-        # First yield: show header + empty body so right column renders immediately
         current = answer_prefix
         yield (current, sources_md, snippets_md, current)
 
-        # Stream tokens
         for chunk in llm.generate_content(prompt, generation_config=generation_config, stream=True):
             token = getattr(chunk, "text", None)
             if token:
@@ -401,7 +375,6 @@ def stream_answer(user_query: str, region: str, month: str, top_k: int, last_ans
     except Exception as e:
         yield (f"❌ Query error: {e}", "", "", "")
 
-# Download helper
 def download_answer_md(answer_text: str):
     if not answer_text:
         return None
@@ -411,7 +384,7 @@ def download_answer_md(answer_text: str):
     return path
 
 # --------------------
-# 4) Gradio UI (Two Tabs, readable)
+# 4) Gradio UI (Two Tabs, readable, with loading UX)
 # --------------------
 THEME = gr.themes.Soft(primary_hue="blue")
 CSS = """
@@ -421,7 +394,20 @@ footer {visibility: hidden}
 #answer_md li {margin: .18rem 0;}
 #answer_md a {color: #64748b; text-decoration: none;}
 .badge {display:inline-block;padding:4px 10px;border-radius:999px;background:#0ea5e9;color:white;font-size:12px;margin-left:8px}
+.status {font-size: .95rem; opacity: .8}
+
+/* sticky ask bar */
+#ask_bar {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  background: var(--background-fill-primary, #fff);
+  border-bottom: 1px solid #e5e7eb;
+  box-shadow: 0 2px 8px rgba(0,0,0,.04);
+  padding: 10px 8px 12px;
+}
 """
+
 
 def ui_ingest(file, title, region, month):
     if file is None:
@@ -467,22 +453,57 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
         title = gr.Textbox(label="Title (optional)")
         region = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True)
         month  = gr.Dropdown(choices=MONTHS,  label="Month (optional, e.g., 2025-07)", allow_custom_value=True)
+        upload_status = gr.Markdown(elem_classes=["status"])
         out_u = gr.Markdown()
-        gr.Button("Ingest File", variant="primary").click(ui_ingest, [file, title, region, month], [out_u])
+        ingest_btn = gr.Button("Ingest File", variant="primary")
+
+        # Loading UX for file ingest
+        ingest_btn.click(
+            lambda: (gr.update(value="Ingesting…", interactive=False), "⏳ Ingesting file…"),
+            inputs=[],
+            outputs=[ingest_btn, upload_status],
+        ).then(
+            ui_ingest, [file, title, region, month], [out_u]
+        ).then(
+            lambda: (gr.update(value="Ingest File", interactive=True), ""),
+            inputs=[],
+            outputs=[ingest_btn, upload_status],
+        )
 
         gr.Markdown("### Or ingest from the web")
         urls_box = gr.Textbox(lines=6, label="Web URLs (one per line)", placeholder="https://www.who.int/...\nhttps://www.cdc.gov/...")
+        upload_status_urls = gr.Markdown(elem_classes=["status"])
         out_u_urls = gr.Markdown()
-        gr.Button("Fetch & Ingest URLs", variant="secondary").click(ui_ingest_urls, [urls_box, region, month], [out_u_urls])
+        ingest_urls_btn = gr.Button("Fetch & Ingest URLs", variant="secondary")
+
+        # Loading UX for URL ingest
+        ingest_urls_btn.click(
+            lambda: (gr.update(value="Fetching…", interactive=False), "⏳ Fetching pages…"),
+            inputs=[],
+            outputs=[ingest_urls_btn, upload_status_urls],
+        ).then(
+            ui_ingest_urls, [urls_box, region, month], [out_u_urls]
+        ).then(
+            lambda: (gr.update(value="Fetch & Ingest URLs", interactive=True), ""),
+            inputs=[],
+            outputs=[ingest_urls_btn, upload_status_urls],
+        )
 
     with gr.Tab("Ask"):
-        gr.Markdown("Ask a question. Optionally filter by region/month.")
-        q = gr.Textbox(label="Your question", placeholder="e.g., When was the initial alert received?")
-        topk = gr.Slider(3, 20, value=DEFAULT_TOP_K, step=1, label="Top-K passages")
-        region_q = gr.Dropdown(choices=REGIONS, label="Region filter (optional)", allow_custom_value=True)
-        month_q  = gr.Dropdown(choices=MONTHS,  label="Month filter (optional, e.g., 2025-07)", allow_custom_value=True)
+        # Sticky ask bar
+        with gr.Column(elem_id="ask_bar"):
+            gr.Markdown("Ask a question. Optionally filter by region/month.")
+            with gr.Row():
+                q = gr.Textbox(label="Your question", placeholder="e.g., When was the initial alert received?", scale=8)
+                ask_btn = gr.Button("Ask (Streaming)", variant="primary", scale=2)
+            with gr.Row():
+                region_q = gr.Dropdown(choices=REGIONS, label="Region (optional)", allow_custom_value=True, scale=3)
+                month_q = gr.Dropdown(choices=MONTHS, label="Month (optional, e.g., 2025-07)", allow_custom_value=True,
+                                      scale=3)
+                topk = gr.Slider(3, 20, value=DEFAULT_TOP_K, step=1, label="Top-K", scale=4)
+            ask_status = gr.Markdown(elem_classes=["status"])
 
-        # Two-column readable layout
+        # Content below (scrolls under the sticky bar)
         with gr.Row():
             with gr.Column(scale=2):
                 ans_md = gr.Markdown(elem_id="answer_md")
@@ -490,18 +511,34 @@ with gr.Blocks(title="HealthLens", theme=THEME, css=CSS) as demo:
                     last_answer = gr.State("")
                     dl = gr.DownloadButton("⬇️ Download answer (.md)", variant="secondary")
                     dl.click(download_answer_md, inputs=[last_answer], outputs=[])
-
             with gr.Column(scale=1):
                 with gr.Accordion("Sources", open=True):
                     out_src = gr.Markdown()
                 with gr.Accordion("Top Snippets", open=False):
                     out_snip = gr.Markdown()
 
-        # STREAMING: function yields (answer, sources, snippets, state)
-        gr.Button("Ask (Streaming)", variant="primary").click(
+        # Smooth-scroll to the answer area (optional; sticky ask stays visible)
+        scroll_js = """
+    () => {
+      const el = document.getElementById('answer_md');
+      if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});
+    }
+        """.strip()
+
+        # Loading UX for Ask: disable + label + status + scroll; then stream; then reset
+        ask_btn.click(
+            lambda: (gr.update(value="Thinking…", interactive=False), "⏳ Generating…"),
+            inputs=[],
+            outputs=[ask_btn, ask_status],
+            scroll_to_output=True,  # auto-scrolls to first output
+        ).then(
             fn=stream_answer,
             inputs=[q, region_q, month_q, topk, last_answer],
             outputs=[ans_md, out_src, out_snip, last_answer],
+        ).then(
+            lambda: (gr.update(value="Ask", interactive=True), ""),
+            inputs=[],
+            outputs=[ask_btn, ask_status],
         )
 
 if __name__ == "__main__":
